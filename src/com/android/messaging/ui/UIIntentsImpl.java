@@ -374,10 +374,35 @@ public class UIIntentsImpl extends UIIntents {
         if (conversationIdSet != null) {
             intent.putExtra(UI_INTENT_EXTRA_CONVERSATION_ID_SET,
                     conversationIdSet.getDelimitedString());
+            // PendingIntent equality ignores extras, so without a distinguishing data uri the
+            // summary and every per-conversation child would share a single delete PendingIntent
+            // (dismissing one child would then clear the wrong conversation). Encode the target
+            // conversation set into the intent data to keep them distinct.
+            intent.setData(new Uri.Builder()
+                    .scheme("bugle")
+                    .authority("reset-notifications")
+                    .appendQueryParameter("conversations", conversationIdSet.getDelimitedString())
+                    .build());
         }
         return PendingIntent.getBroadcast(context,
                 requestCode, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+    }
+
+    @Override
+    public PendingIntent getPendingIntentForMarkingAsRead(final Context context,
+            final String conversationId, final int requestCode) {
+        final Intent intent = new Intent(context, NotificationReceiver.class);
+        intent.setAction(ACTION_MARK_AS_READ);
+        intent.putExtra(UI_INTENT_EXTRA_CONVERSATION_ID, conversationId);
+        // Keep the PendingIntent distinct per conversation (extras are ignored for matching).
+        intent.setData(new Uri.Builder()
+                .scheme("bugle")
+                .authority("mark-as-read")
+                .appendQueryParameter("conversation", conversationId)
+                .build());
+        return PendingIntent.getBroadcast(context, requestCode, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 
     /**

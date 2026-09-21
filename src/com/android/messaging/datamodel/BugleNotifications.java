@@ -111,6 +111,12 @@ public class BugleNotifications {
     public static final int LOCAL_SMS_NOTIFICATION = 0;
 
     private static final String SMS_NOTIFICATION_TAG = ":sms:";
+    // Dedicated tag for the multi-conversation group summary. Keeping it separate from
+    // SMS_NOTIFICATION_TAG (used for a single standalone conversation notification) means the two
+    // never share a notification key, so transitioning between "one conversation" and "many
+    // conversations" is just an independent post + cancel and can't trip the platform's
+    // orphan-group-summary auto-dismissal.
+    private static final String SMS_GROUP_SUMMARY_NOTIFICATION_TAG = ":sms:summary:";
     private static final String SMS_ERROR_NOTIFICATION_TAG = ":error:";
 
     private static final String WEARABLE_COMPANION_APP_PACKAGE = "com.google.android.wearable.app";
@@ -223,6 +229,12 @@ public class BugleNotifications {
             }
         }
         notificationManager.cancel(notificationTag, type);
+        if (type == PendingIntentConstants.SMS_NOTIFICATION_ID && conversationId == null
+                && !isBundledNotification) {
+            // Also drop the group summary (it lives under its own tag).
+            notificationManager.cancel(
+                    buildNotificationTag(SMS_GROUP_SUMMARY_NOTIFICATION_TAG, null), type);
+        }
         if (LogUtil.isLoggable(TAG, LogUtil.DEBUG)) {
             LogUtil.d(TAG, "Canceled notifications of type " + type);
         }
@@ -373,13 +385,11 @@ public class BugleNotifications {
         }
         state.mBaseRequestCode = state.mType;
 
-        // Set the delete intent (except for bundled wearable notifications, which are dismissed
-        // as a group, either from the wearable or when the summary notification is dismissed from
-        // the host device).
-        if (!(state instanceof BundledMessageNotificationState)) {
-            final PendingIntent clearIntent = state.getClearIntent();
-            notifBuilder.setDeleteIntent(clearIntent);
-        }
+        // Set the delete intent so that swiping the notification away marks its conversation(s)
+        // as seen. Per-conversation children get their own (conversation-scoped) clear intent so
+        // dismissing one doesn't affect the others and it doesn't reappear on the next update.
+        final PendingIntent clearIntent = state.getClearIntent();
+        notifBuilder.setDeleteIntent(clearIntent);
 
         updateBuilderAudioVibrate(state, notifBuilder, silent, conversationId);
 
@@ -535,7 +545,13 @@ public class BugleNotifications {
     private static void createMessageNotification(final boolean silent,
             final String conversationId) {
         final NotificationState state = MessageNotificationState.getNotificationState();
-        final boolean softSound = DataModel.get().isNewMessageObservable(conversationId);
+        // "Soft sound" (play a quiet beep instead of posting a notification) only applies when a
+        // specific conversation just received a message while it's observable. A conversationId of
+        // null means this is a plain refresh (mark as read/seen, redownload, ...), which must
+        // still re-post the notifications for the conversations that are still unread - otherwise
+        // marking one conversation read while the app is open would silently tear the others down.
+        final boolean softSound = conversationId != null
+                && DataModel.get().isNewMessageObservable(conversationId);
         if (state == null) {
             cancel(PendingIntentConstants.SMS_NOTIFICATION_ID);
             if (softSound && !TextUtils.isEmpty(conversationId)) {
@@ -543,12 +559,17 @@ public class BugleNotifications {
             }
             return;
         }
+        // Only the conversation that actually received a new message should alert (sound,
+        // vibration, heads-up). Anything else we (re-)post here is just a refresh and must stay
+        // silent - otherwise an older conversation's notification pops up again as a fresh
+        // heads-up whenever a new message arrives in a different conversation.
+        state.mSuppressAlert = silent || !isAlertingConversation(state, conversationId);
         processAndSend(state, silent, softSound);
 
-        // The rest of the logic here is for supporting Android Wear devices, specifically for when
-        // we are notifying about multiple conversations. In that case, the Inbox-style summary
-        // notification (which we already processed above) appears on the phone (as it always has),
-        // but wearables show per-conversation notifications, bundled together in a group.
+        // When we are notifying about multiple conversations, the Inbox-style summary above is
+        // shown collapsed on the phone; in addition we post one notification per conversation so
+        // each one can be expanded, actioned and dismissed individually (wearables show these
+        // too, bundled together in a group).
 
         // It is valid to replace a notification group with another group with fewer conversations,
         // or even with one notification for a single conversation. In either case, we need to
@@ -559,20 +580,57 @@ public class BugleNotifications {
             cancelStaleGroupChildren(oldGroupChildIds, state);
         }
 
-        // Send per-conversation notifications (if there are multiple conversations).
+        // The group summary and the single standalone notification use different tags, so when we
+        // switch between them we have to cancel whichever one we're no longer showing. Skip this
+        // when softSound is set: nothing was (re-)posted above, so there's nothing to reconcile
+        // and cancelling would just drop a notification the user still wants.
+        if (!softSound) {
+            final NotificationManagerCompat notificationManager =
+                    NotificationManagerCompat.from(context);
+            if (state instanceof MultiConversationNotificationState) {
+                notificationManager.cancel(buildNotificationTag(SMS_NOTIFICATION_TAG, null),
+                        PendingIntentConstants.SMS_NOTIFICATION_ID);
+            } else {
+                notificationManager.cancel(
+                        buildNotificationTag(SMS_GROUP_SUMMARY_NOTIFICATION_TAG, null),
+                        PendingIntentConstants.SMS_NOTIFICATION_ID);
+            }
+        }
+
+        // Send per-conversation notifications (only when there are multiple conversations).
         final ConversationIdSet groupChildIds = new ConversationIdSet();
         if (state instanceof MultiConversationNotificationState) {
             for (final NotificationState child :
                 ((MultiConversationNotificationState) state).mChildren) {
+                final String childConversationId = child.mConversationIds != null
+                        ? child.mConversationIds.first() : null;
+                child.mSuppressAlert = silent
+                        || childConversationId == null
+                        || !childConversationId.equals(conversationId);
                 processAndSend(child, true /* silent */, softSound);
-                if (child.mConversationIds != null) {
-                    groupChildIds.add(child.mConversationIds.first());
+                if (childConversationId != null) {
+                    groupChildIds.add(childConversationId);
                 }
             }
         }
 
         // Record the new set of group children.
         writeGroupChildIds(context, groupChildIds);
+    }
+
+    /**
+     * Returns true if {@code conversationId} is the conversation that just received a new message
+     * and {@code state} represents (only) that conversation - i.e. this notification should alert.
+     * The summary notification for multiple conversations never alerts on its own; its per-
+     * conversation child notifications do.
+     */
+    private static boolean isAlertingConversation(final NotificationState state,
+            final String conversationId) {
+        if (conversationId == null || state.mConversationIds == null
+                || state instanceof MultiConversationNotificationState) {
+            return false;
+        }
+        return state.mConversationIds.contains(conversationId);
     }
 
     private static void updateBuilderAudioVibrate(final NotificationState state,
@@ -715,7 +773,7 @@ public class BugleNotifications {
                 context.getTheme()));
 
         final WearableExtender wearableExtender = new WearableExtender();
-        setWearableGroupOptions(notifBuilder, notificationState);
+        setGroupOptions(notifBuilder, notificationState);
 
         if (notificationState instanceof MultiMessageNotificationState) {
             if (attachmentBitmap != null) {
@@ -736,6 +794,7 @@ public class BugleNotifications {
                 notificationState.mNotificationBuilder.setLargeIcon(smallBitmap);
             }
 
+            addMarkAsReadAction(notifBuilder, notificationState);
             addDownloadMmsAction(notifBuilder, wearableExtender, notificationState);
             addWearableVoiceReplyAction(notifBuilder, wearableExtender, notificationState);
         }
@@ -745,12 +804,18 @@ public class BugleNotifications {
         doNotify(notifBuilder.build(), notificationState);
     }
 
-    private static void setWearableGroupOptions(final NotificationCompat.Builder notifBuilder,
+    private static void setGroupOptions(final NotificationCompat.Builder notifBuilder,
             final NotificationState notificationState) {
         final String groupKey = "groupkey";
-        LogUtil.v(TAG, "Group key (for wearables)=" + groupKey);
+        LogUtil.v(TAG, "Group key=" + groupKey);
         if (notificationState instanceof MultiConversationNotificationState) {
-            notifBuilder.setGroup(groupKey).setGroupSummary(true);
+            // The summary itself never alerts - the per-conversation child that received the new
+            // message does (GROUP_ALERT_CHILDREN). setOnlyAlertOnce keeps the summary quiet when
+            // it is refreshed as messages come in.
+            notifBuilder.setGroup(groupKey)
+                    .setGroupSummary(true)
+                    .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+                    .setOnlyAlertOnce(true);
         } else if (notificationState instanceof BundledMessageNotificationState) {
             final int order = ((BundledMessageNotificationState) notificationState).mGroupOrder;
             // Convert the order to a zero-padded string ("00", "01", "02", etc).
@@ -758,6 +823,16 @@ public class BugleNotifications {
             // by the sort key, hence the need for zeroes to preserve the ordering.
             final String sortKey = String.format(Locale.US, "%02d", order);
             notifBuilder.setGroup(groupKey).setSortKey(sortKey);
+            if (notificationState.mSuppressAlert) {
+                // This conversation did not get the new message; add it to the group silently by
+                // deferring all alerting to the (silent) summary.
+                notifBuilder.setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+                        .setOnlyAlertOnce(true);
+            }
+        } else if (notificationState.mSuppressAlert) {
+            // Standalone conversation notification that is only being refreshed. (Message
+            // notifications are always built as a group now, so this branch is only a safety net.)
+            notifBuilder.setOnlyAlertOnce(true);
         }
     }
 
@@ -805,6 +880,22 @@ public class BugleNotifications {
         remoteInputBuilder.setChoices(choices);
         wearActionBuilder.addRemoteInput(remoteInputBuilder.build());
         wearableExtender.addAction(wearActionBuilder.build());
+    }
+
+    private static void addMarkAsReadAction(final NotificationCompat.Builder notifBuilder,
+            final NotificationState notificationState) {
+        if (!(notificationState instanceof MultiMessageNotificationState)) {
+            return;
+        }
+        final Context context = Factory.get().getApplicationContext();
+        final String conversationId = notificationState.mConversationIds.first();
+        final int requestCode = ((MultiMessageNotificationState) notificationState)
+                .getMarkAsReadIntentRequestCode();
+        final PendingIntent markAsReadPendingIntent = UIIntents.get()
+                .getPendingIntentForMarkingAsRead(context, conversationId, requestCode);
+        notifBuilder.addAction(new NotificationCompat.Action.Builder(R.drawable.ic_checkmark_light,
+                context.getString(R.string.notification_mark_as_read),
+                markAsReadPendingIntent).build());
     }
 
     private static void addDownloadMmsAction(final NotificationCompat.Builder notifBuilder,
@@ -859,8 +950,13 @@ public class BugleNotifications {
         if (conversationIds != null && conversationIds.size() == 1) {
             conversationId = conversationIds.first();
         }
-        final String notificationTag = buildNotificationTag(type,
-                conversationId, isBundledNotification);
+        final String notificationTag;
+        if (notificationState instanceof MultiConversationNotificationState) {
+            // The group summary has its own tag, independent of any single-conversation tag.
+            notificationTag = buildNotificationTag(SMS_GROUP_SUMMARY_NOTIFICATION_TAG, null);
+        } else {
+            notificationTag = buildNotificationTag(type, conversationId, isBundledNotification);
+        }
 
         notification.flags |= Notification.FLAG_AUTO_CANCEL;
         notification.defaults |= Notification.DEFAULT_LIGHTS;
